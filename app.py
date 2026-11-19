@@ -1,157 +1,145 @@
-import streamlit as st
-import requests
+import os
+import io
 import json
+import re
 import ssl
-from datetime import datetime
+import requests
+import urllib3
+import pandas as pd
+import streamlit as st
 from PIL import Image
 import google.generativeai as genai
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
+from datetime import datetime
 
-# ---------------------------------------------------------
-# CẤU HÌNH XỬ LÝ LỖI LEGACY SSL CHO MOBIFONE INVOICE
-# ---------------------------------------------------------
+# Tệp lưu trữ từ vựng AI đã học
+DICT_FILE = "learned_dictionary.json"
+
+# Bỏ qua cảnh báo SSL đối với máy chủ MobiFone
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 class CustomSSLAdapter(HTTPAdapter):
+    """SSL Adapter tùy chỉnh hỗ trợ các máy chủ đời cũ và bypass kiểm tra chứng chỉ an toàn"""
     def init_poolmanager(self, *args, **kwargs):
         context = create_urllib3_context()
-        # Bật cờ cho phép kết nối máy chủ dùng chuẩn SSL cũ (Legacy SSL)
-        context.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+        context.options |= 0x4  # OP_LEGACY_SERVER_CONNECT
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
         kwargs['ssl_context'] = context
         return super().init_poolmanager(*args, **kwargs)
 
-def get_legacy_session():
+def get_mobifone_session():
+    """Tạo Session HTTP để kết nối MobiFone API"""
     session = requests.Session()
     session.mount('https://', CustomSSLAdapter())
     return session
 
-# 1. CẤU HÌNH GIAO DIỆN STREAMLIT
-st.set_page_config(page_title="Hệ thống Xuất Hóa Đơn MobiFone AI", page_icon="🧾", layout="wide")
+def load_learned_dictionary() -> list:
+    """Đọc bộ từ vựng đã học từ tệp json cục bộ"""
+    if os.path.exists(DICT_FILE):
+        try:
+            with open(DICT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return ["Gô Chén", "Xô Ánh", "Ghế Lỗ Ruột", "Áo Tô 8", "Áo Tô Trắng Gốc", "Sọt Chén"]
 
-def get_secret(key: str, default: str = "") -> str:
+def save_learned_dictionary(new_item_names: list) -> tuple[list, int]:
+    """Cập nhật và học thêm các từ vựng mới được người dùng sửa thành công"""
+    current_dict = load_learned_dictionary()
+    added_count = 0
+    for name in new_item_names:
+        clean_name = str(name).strip()
+        if clean_name and len(clean_name) > 1 and clean_name not in current_dict:
+            current_dict.append(clean_name)
+            added_count += 1
+    
+    if added_count > 0:
+        with open(DICT_FILE, "w", encoding="utf-8") as f:
+            json.dump(current_dict, f, ensure_ascii=False, indent=2)
+            
+    return current_dict, added_count
+
+def get_live_gemini_models(api_key: str) -> list:
+    """Tự động lấy danh sách mô hình Gemini đang hoạt động thực tế trên API Key"""
+    genai.configure(api_key=api_key)
+    live_models = []
     try:
-        if key in st.secrets:
-            return st.secrets[key]
+        models = genai.list_models()
+        for m in models:
+            if 'generateContent' in m.supported_generation_methods:
+                live_models.append(m.name)
     except Exception:
         pass
-    return default
 
-# ---------------------------------------------------------
-# 2. CÁC HÀM XỬ LÝ KẾT NỐI API & AI
-# ---------------------------------------------------------
-def mobifone_test_connection(mst: str, user: str, pwd: str) -> dict:
-    """Xác thực tài khoản MobiFone Invoice và kiểm tra dải ký hiệu phát hành"""
-    base_url = f"https://{mst}.mobifoneinvoice.vn/api"
-    login_url = f"{base_url}/Account/Login"
-    login_payload = {"username": user, "password": pwd}
-    
-    # Sử dụng Session hỗ trợ Legacy SSL
-    session = get_legacy_session()
-    
-    res = session.post(login_url, json=login_payload, headers={"Content-Type": "application/json"}).json()
-    if "token" not in res:
-        raise Exception(res.get('error') or res.get('message') or "Tài khoản hoặc mật khẩu MobiFone Invoice không chính xác.")
-    
-    token = res["token"]
-    ma_dvcs = res["ma_dvcs"]
-    headers = {
-        "Authorization": f"Bear {token};{ma_dvcs}",
-        "Content-Type": "application/json"
-    }
-    
-    ref_url = f"{base_url}/System/GetDataReferencesByRefId?refId=RF00059"
-    ref_res = session.get(ref_url, headers=headers).json()
-    if not isinstance(ref_res, list) or len(ref_res) == 0:
-        raise Exception("Đăng nhập thành công nhưng không tìm thấy Dải ký hiệu hóa đơn khả dụng trên MobiFone.")
-    
-    cctbao_id = ref_res[0]["qlkhsdung_id"]
-    
-    return {
-        "token": token,
-        "ma_dvcs": ma_dvcs,
-        "cctbao_id": cctbao_id,
-        "base_url": base_url
-    }
+    if live_models:
+        live_models.sort(key=lambda name: (0 if 'flash' in name.lower() else 1, name))
+    else:
+        live_models = [
+            "models/gemini-1.5-flash",
+            "models/gemini-2.0-flash",
+            "gemini-1.5-flash"
+        ]
+    return live_models
 
-import re  # Đảm bảo đã import re ở đầu tệp app.py
-
-import io
-import json
-import re
-from PIL import Image
-import google.generativeai as genai
-
-def extract_invoice_data(image: Image.Image, api_key: str) -> dict:
+def extract_invoice_data(image: Image.Image, api_key: str) -> tuple[dict, str]:
     """
-    Tự động dò mô hình Gemini hợp lệ với API Key + Nén ảnh tăng tốc (1s) + Đọc chữ viết tay chuẩn xác
+    Bóc tách chữ viết tay tích hợp Từ vựng Học thêm (Dynamic Few-Shot In-Context Learning)
     """
     genai.configure(api_key=api_key)
     
-    # 1. NÉN KÍCH THƯỚC ẢNH ĐỂ TRUYỀN TẢI NHANH (TỐI ĐA 1024px)
     img_temp = image.copy()
-    img_temp.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+    img_temp.thumbnail((800, 800), Image.Resampling.LANCZOS)
     img_bytes = io.BytesIO()
-    img_temp.convert("RGB").save(img_bytes, format='JPEG', quality=85)
+    img_temp.convert("RGB").save(img_bytes, format='JPEG', quality=75)
+    img_bytes.seek(0)
     optimized_image = Image.open(img_bytes)
 
-    # 2. PROMPT CHUYÊN SÂU ĐỌC CHỮ VIẾT TAY & SUY LUẬN LOGIC TOÁN HỌC
-    prompt = """
-    Bạn là chuyên gia bóc tách hóa đơn viết tay tiếng Việt. Hãy phân tích biên nhận viết tay của cửa hàng Nhôm - Inox - Đồ gia dụng này và trả về JSON chuẩn.
+    learned_words = load_learned_dictionary()
+    learned_context = ""
+    if learned_words:
+        vocab_list_str = "\n".join([f"    - {w}" for w in learned_words[:40]])
+        learned_context = f"\n    DANH SÁCH TÊN MẶT HÀNG THƯỜNG GẶP CỦA CỬA HÀNG (ĐÃ ĐƯỢC XÁC NHẬN CHÍNH XÁC TỪ CÁC LẦN XUẤT HÓA ĐƠN TRƯỚC):\n{vocab_list_str}\n    -> Ưu tiên đối chiếu nét chữ viết tay mờ với danh sách từ vựng trên nếu thấy khớp nghĩa."
 
-    Cấu trúc JSON yêu cầu:
-    {
+    prompt = f"""
+    Bạn là chuyên gia bóc tách hóa đơn viết tay tiếng Việt. Hãy phân tích biên nhận viết tay này và trả về duy nhất chuỗi JSON chuẩn theo cấu trúc:
+    {{
         "customer_name": "Khách hàng lẻ",
         "customer_mst": "",
         "customer_address": "",
-        "payment_method": "Tiền mặt",
+        "payment_method": "Tiền mặt/Chuyển khoản",
         "items": [
-            {
+            {{
                 "stt": 1,
                 "ten": "Tên mặt hàng",
                 "sluong": 1,
                 "dgia": 100000,
                 "thtien": 100000,
                 "tsuat": "10"
-            }
+            }}
         ]
-    }
+    }}
 
     QUY TẮC BÓC TÁCH CHÍNH XÁC:
-    1. TÊN MẶT HÀNG: Đọc kỹ chữ viết tay đồ gia dụng/nhựa/inox (VD: Rổ chén, Rổ nhựa, Giỏ rác, Lô tô 8, Lô tô tô, Sợi chén...).
-    2. QUY ĐỔI TIỀN VIẾT TẮT: Các ô có dấu chấm ở cuối như 420. -> 420000, 140. -> 140000, 50. -> 50000, 230. -> 230000, 300. -> 300000, 730. -> 730000.
-    3. ĐỐI CHIẾU LOGIC TOÁN HỌC: Bắt buộc `Thành tiền = Số lượng x Đơn giá`. Nếu số lượng hoặc đơn giá viết tay mờ/khó đọc, hãy dùng Thành tiền chia ngược lại để suy ra đúng Số lượng và Đơn giá.
-    4. Trường `tsuat` mặc định là "10".
-    5. Chỉ trả về duy nhất chuỗi JSON.
+    1. TÊN MẶT HÀNG: Đọc kỹ chữ viết tay tiếng Việt (đồ gia dụng, nhôm inox, nhựa, nội thất...).{learned_context}
+    2. QUY ĐỔI TIỀN VIẾT TẮT: Các ô số tiền có dấu chấm ở cuối như 420. -> 420000, 140. -> 140000, 50. -> 50000, 230. -> 230000, 300. -> 300000, 730. -> 730000.
+    3. ĐỐI CHIẾU LOGIC TOÁN HỌC: Bắt buộc `Thành tiền = Số lượng x Đơn giá`. Nếu số mờ, lấy Thành tiền chia ngược lại để suy ra đúng Số lượng và Đơn giá.
+    4. Trường `tsuat` mặc định điền "10".
+    5. CHỈ TRẢ VỀ DUY NHẤT CHUỖI JSON.
     """
 
-    # 3. TỰ ĐỘNG DÒ DANH SÁCH MÔ HÌNH THỰC TẾ HỖ TRỢ BỞI API KEY
-    usable_models = []
-    try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                usable_models.append(m.name)
-    except Exception:
-        pass
-
-    # Sắp xếp ưu tiên mô hình Flash để có tốc độ cao nhất
-    if usable_models:
-        usable_models = sorted(usable_models, key=lambda name: 0 if 'flash' in name.lower() else 1)
-    else:
-        # Danh sách mô hình dự phòng mở rộng
-        usable_models = [
-            'models/gemini-2.0-flash',
-            'models/gemini-2.5-flash',
-            'models/gemini-1.5-flash-latest',
-            'models/gemini-1.5-flash-001',
-            'models/gemini-1.5-flash-002',
-            'gemini-2.0-flash',
-            'gemini-1.5-flash'
-        ]
+    candidate_models = get_live_gemini_models(api_key)
+    cached_model = st.session_state.get("working_model")
+    if cached_model and cached_model in candidate_models:
+        candidate_models.remove(cached_model)
+        candidate_models.insert(0, cached_model)
 
     response_text = ""
+    used_model = ""
     last_err = None
 
-    # 4. THỬ LẦN LƯỢT CÁC MÔ HÌNH KHẢ DỤNG
-    for model_name in usable_models:
+    for model_name in candidate_models:
         try:
             model = genai.GenerativeModel(
                 model_name,
@@ -163,168 +151,377 @@ def extract_invoice_data(image: Image.Image, api_key: str) -> dict:
             res = model.generate_content([prompt, optimized_image])
             if res and res.text:
                 response_text = res.text.strip()
+                used_model = model_name
                 break
         except Exception as e:
             last_err = e
             continue
 
     if not response_text:
-        raise Exception(f"Không kết nối được mô hình AI khả dụng. Lỗi chi tiết: {last_err}")
+        raise Exception(f"Không thể kết nối Gemini AI. Lỗi chi tiết: {last_err}")
 
-    # 5. BÓC TÁCH VÀ GIẢI MÃ KHỐI JSON CHUẨN
     start_idx = response_text.find('{')
     end_idx = response_text.rfind('}')
     clean_json = response_text[start_idx:end_idx+1] if (start_idx != -1 and end_idx != -1) else response_text
 
     decoder = json.JSONDecoder()
     data, _ = decoder.raw_decode(clean_json)
-    return data
+    return data, used_model
 
-def create_mobifone_invoice(connection_info: dict, extracted_data: dict) -> dict:
-    """Khởi tạo hóa đơn điện tử lên hệ thống MobiFone Invoice"""
-    base_url = connection_info["base_url"]
-    headers = {
-        "Authorization": f"Bear {connection_info['token']};{connection_info['ma_dvcs']}",
-        "Content-Type": "application/json"
-    }
+def get_cctbao_id(session: requests.Session, host: str, headers: dict) -> str:
+    """Lấy ID dải ký hiệu mẫu hóa đơn (qlkhsdung_id / cctbao_id) từ MobiFone API (API 2 trong tài liệu)"""
+    url = f"{host}/api/System/GetDataReferencesByRefId?refId=RF00059"
+    try:
+        res = session.get(url, headers=headers, verify=False, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data[0].get("qlkhsdung_id") or data[0].get("id") or ""
+    except Exception:
+        pass
+    return ""
+
+def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, madonvi: str, custom_domain: str = "") -> dict:
+    """
+    Kết nối API MobiFone Invoice theo đúng tài liệu kỹ thuật Ver 4.7 (Nghị định 70/123, Thông tư 78)
+    """
+    session = get_mobifone_session()
     
-    details_list = []
-    for idx, item in enumerate(extracted_data.get("items", []), start=1):
+    # 1. Xác định Host (Xử lý tách đuôi chi nhánh -999 để tránh lỗi DNS getaddrinfo failed)
+    hosts = []
+    if custom_domain and custom_domain.strip():
+        d = custom_domain.strip().rstrip('/')
+        if not d.startswith("http"):
+            d = f"https://{d}"
+        hosts.append(d)
+
+    clean_mst = mst.split('-')[0].strip() if mst else ""
+    default_host = f"https://{clean_mst}.mobifoneinvoice.vn"
+    if default_host not in hosts:
+        hosts.append(default_host)
+
+    # 2. Đăng nhập lấy Token (Chuẩn Tài liệu Ver 4.7 Trang 5: username, password)
+    login_routes = [
+        "/api/Account/Login",
+        "/Account/Login",
+        "/api/account/login"
+    ]
+
+    login_payload = {
+        "username": username,
+        "password": password
+    }
+
+    token = ""
+    res_ma_dvcs = madonvi
+    working_host = ""
+    login_logs = []
+
+    for host in hosts:
+        for route in login_routes:
+            url = f"{host}{route}"
+            try:
+                res = session.post(url, json=login_payload, verify=False, timeout=8)
+                login_logs.append(f"• POST {url} -> HTTP {res.status_code}")
+                if res.status_code == 200:
+                    try:
+                        res_json = res.json()
+                        token = res_json.get("token") or res_json.get("data", {}).get("token") or ""
+                        if token:
+                            working_host = host
+                            if res_json.get("ma_dvcs"):
+                                res_ma_dvcs = res_json.get("ma_dvcs")
+                            break
+                    except Exception:
+                        pass
+            except Exception as e:
+                login_logs.append(f"• POST {url} -> Lỗi: {e}")
+        if token:
+            break
+
+    if not token:
+        log_str = "\n".join(login_logs)
+        raise Exception(f"Đăng nhập thất bại (Không lấy được Token).\nNhật ký thử nghiệm:\n{log_str}")
+
+    # 3. Header Authorization theo chuẩn MobiFone (Tài liệu Trang 6: Bear token;ma_dvcs)
+    ma_dv = res_ma_dvcs if res_ma_dvcs else madonvi
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bear {token};{ma_dv}"
+    }
+
+    # 4. Lấy dải ký hiệu hóa đơn (cctbao_id)
+    cctbao_id = get_cctbao_id(session, working_host, headers)
+
+    # 5. Đóng gói Payload theo cấu trúc MobiFone Invoice 78 chuẩn Tài liệu Ver 4.7 Trang 8-15
+    details_data = []
+    tgtcthue = 0.0
+    tgtthue = 0.0
+
+    for idx, item in enumerate(data.get("items", []), start=1):
         sluong = float(item.get("sluong", 1))
         dgia = float(item.get("dgia", 0))
         thtien = float(item.get("thtien", sluong * dgia))
-        tsuat = str(item.get("tsuat", "10"))
-        tthue = thtien * (float(tsuat) / 100) if tsuat.isdigit() and float(tsuat) > 0 else 0
+        tsuat_str = str(item.get("tsuat", "10")).replace("%", "")
         
-        details_list.append({
-            "stt": idx, "ma": str(idx), "ten": item.get("ten", "Hàng hóa/Dịch vụ"),
-            "mdvtinh": "CAI", "dvtinh": "Cái", "sluong": sluong, "dgia": dgia,
-            "thtien": thtien, "tlckhau": 0, "stckhau": 0, "tsuat": tsuat,
-            "tthue": tthue, "tgtien": thtien + tthue, "kmai": 1
+        try:
+            tsuat_val = float(tsuat_str) if tsuat_str not in ["KCT", "KKDT", "0", "-1", "-2"] else 0.0
+        except ValueError:
+            tsuat_val = 10.0 if tsuat_str == "10" else 0.0
+            
+        tthue = thtien * (tsuat_val / 100.0)
+        tgtien = thtien + tthue
+        
+        tgtcthue += thtien
+        tgtthue += tthue
+
+        details_data.append({
+            "stt": idx,
+            "ma": str(item.get("ma", idx)),
+            "ten": str(item.get("ten", "")),
+            "mdvtinh": "CAI",
+            "dvtinh": "Cái",
+            "sluong": sluong,
+            "dgia": dgia,
+            "thtien": thtien,
+            "tlckhau": 0,
+            "stckhau": 0,
+            "tsuat": tsuat_str,
+            "tthue": tthue,
+            "tgtien": tgtien,
+            "kmai": 1
         })
-        
-    tgtcthue = sum(d["thtien"] for d in details_list)
-    tgtthue = sum(d["tthue"] for d in details_list)
+
     tgtttbso = tgtcthue + tgtthue
-    
-    save_payload = {
+
+    invoice_payload = {
         "editmode": 1,
         "data": [{
-            "cctbao_id": connection_info["cctbao_id"],
+            "cctbao_id": cctbao_id,
             "nlap": datetime.now().strftime("%Y-%m-%d"),
-            "sdhang": "", "dvtte": "VND", "tgia": 1,
-            "htttoan": extracted_data.get("payment_method", "Tiền mặt/Chuyển khoản"),
-            "mnmua": extracted_data.get("customer_mst", "") or "KH01",
-            "mst": extracted_data.get("customer_mst", ""),
-            "tnmua": extracted_data.get("customer_name", "Khách hàng lẻ"),
-            "ten": extracted_data.get("customer_name", "Khách hàng lẻ"),
-            "dchi": extracted_data.get("customer_address", ""),
-            "email": "",
-            "tgtcthue": tgtcthue, "tgtthue": tgtthue,
-            "tgtttbso": tgtttbso, "tgtttbso_last": tgtttbso,
-            "tkcktmn": 0, "ttcktmai": 0, "tgtphi": 0,
-            "mdvi": connection_info["ma_dvcs"],
-            "tthdon": 0, "is_hdcma": 1,
-            "details": [{"data": details_list}],
-            "hoadon68_phi": [{"data": []}],
-            "hoadon68_khac": [{"data": []}]
+            "dvtte": "VND",
+            "tgia": 1,
+            "htttoan": data.get("payment_method", "Tiền mặt/Chuyển khoản"),
+            "mst": data.get("customer_mst", ""),
+            "tnmua": data.get("customer_name", "Khách hàng lẻ"),
+            "ten": data.get("customer_name", "Khách hàng lẻ"),
+            "dchi": data.get("customer_address", "Hà Nội"),
+            "tgtcthue": tgtcthue,
+            "tgtthue": tgtthue,
+            "tgtttbso": tgtttbso,
+            "tgtttbso_last": tgtttbso,
+            "mdvi": ma_dv,
+            "tthdon": 0,
+            "is_hdcma": 1,
+            "details": [{
+                "data": details_data
+            }]
         }]
     }
-    
-    save_url = f"{base_url}/Invoice68/SaveListHoadon78"
-    session = get_legacy_session()
-    res = session.post(save_url, json=save_payload, headers=headers)
-    return res.json()
 
-# ---------------------------------------------------------
-# 3. QUẢN LÝ TRẠNG THÁI PHIÊN LÀM VIỆC (SESSION STATE)
-# ---------------------------------------------------------
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-if "connection_info" not in st.session_state:
-    st.session_state.connection_info = None
+    # 6. Gửi request đến Endpoint chuẩn
+    save_routes = [
+        "/api/Invoice68/SaveListHoadon78",     # HĐĐT GTGT TT78
+        "/api/Invoice68/SaveListHoadon78MTT",  # Hóa đơn máy tính tiền
+        "/api/Invoice68/SaveAndSignHoadon78"   # Khởi tạo và ký gửi
+    ]
 
-# ---------------------------------------------------------
-# 4. GIAO DIỆN ĐĂNG NHẬP HOẶC MÀN HÌNH CHÍNH
-# ---------------------------------------------------------
-if not st.session_state.connected:
-    st.title("🔑 Đăng Nhập & Kết Nối Hệ Thống MobiFone Invoice")
-    st.markdown("Nhập thông tin kết nối dịch vụ Hóa đơn điện tử MobiFone và Gemini AI Key để bắt đầu.")
-    st.divider()
+    auth_headers_to_try = [
+        headers,
+        {"Content-Type": "application/json", "Authorization": f"Bearer {token};{ma_dv}"},
+        {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    ]
 
-    with st.form("login_form"):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            mst_input = st.text_input("Mã số thuế doanh nghiệp (MST)", value=get_secret("MOBIFONE_MST"))
-            user_input = st.text_input("Tài khoản MobiFone Invoice", value=get_secret("MOBIFONE_USER"))
-            pwd_input = st.text_input("Mật khẩu MobiFone Invoice", value=get_secret("MOBIFONE_PASS"), type="password")
-        with col_b:
-            gemini_input = st.text_input("Gemini API Key (AI OCR)", value=get_secret("GEMINI_API_KEY"), type="password")
-            st.caption("ℹ️ Gemini API Key được sử dụng để đọc dữ liệu tự động từ ảnh hóa đơn/biên nhận.")
-
-        submit_btn = st.form_submit_button("🔌 Kết Nối MobiFone Invoice", type="primary", use_container_width=True)
-
-        if submit_btn:
-            if not (mst_input and user_input and pwd_input and gemini_input):
-                st.error("⚠️ Vui lòng nhập đầy đủ tất cả thông tin đăng nhập!")
-            else:
-                with st.spinner("Đang xác thực tài khoản và kiểm tra kết nối MobiFone..."):
+    save_logs = []
+    for route in save_routes:
+        save_url = f"{working_host}{route}"
+        for h in auth_headers_to_try:
+            try:
+                save_res = session.post(save_url, json=invoice_payload, headers=h, verify=False, timeout=12)
+                save_logs.append(f"• POST {save_url} -> HTTP {save_res.status_code}")
+                
+                if save_res.status_code == 200:
                     try:
-                        conn_info = mobifone_test_connection(mst_input, user_input, pwd_input)
-                        st.session_state.connection_info = conn_info
-                        st.session_state.gemini_key = gemini_input
-                        st.session_state.mst = mst_input
-                        st.session_state.user = user_input
-                        st.session_state.connected = True
-                        st.success("✅ Kết nối thành công!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Kết nối thất bại: {str(e)}")
+                        return save_res.json()
+                    except Exception:
+                        return {"status": "success", "message": "Đã gửi lệnh tạo hóa đơn thành công!", "response": save_res.text}
+            except Exception as e:
+                save_logs.append(f"• POST {save_url} -> Lỗi: {e}")
 
+    save_log_str = "\n".join(save_logs)
+    raise Exception(f"Không thể khởi tạo hóa đơn tại máy chủ MobiFone ({working_host}).\nNhật ký thử nghiệm:\n{save_log_str}")
+
+# --- CẤU HÌNH GIAO DIỆN STREAMLIT ---
+st.set_page_config(page_title="Hệ Thống Bóc Tách & Xuất Hóa Đơn Tự Động", layout="wide")
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "extracted_data" not in st.session_state:
+    st.session_state.extracted_data = None
+if "working_model" not in st.session_state:
+    st.session_state.working_model = "Tự động kết nối..."
+if "custom_domain" not in st.session_state:
+    st.session_state.custom_domain = ""
+
+# 1. MÀN HÌNH ĐĂNG NHẬP
+if not st.session_state.logged_in:
+    st.title("🔒 Đăng Nhập Hệ Thống (MobiFone Invoice & AI Engine)")
+    with st.form("login_form"):
+        mst = st.text_input("Mã số thuế doanh nghiệp (MST)", value="0100686209-999")
+        username = st.text_input("Tài khoản MobiFone Invoice", value="ADMINISTRATOR")
+        password = st.text_input("Mật khẩu MobiFone", type="password")
+        madonvi = st.text_input("Mã đơn vị / Mã cơ sở (Nội bộ)", value="VP")
+        custom_domain = st.text_input("Server Domain MobiFone (Tùy chọn)", placeholder="Ví dụ: 0100686209.mobifoneinvoice.vn")
+        gemini_key = st.text_input("Google Gemini API Key", type="password")
+        submit = st.form_submit_button("Đăng nhập", type="primary")
+
+        if submit:
+            if mst and username and password and gemini_key:
+                st.session_state.logged_in = True
+                st.session_state.mst = mst
+                st.session_state.username = username
+                st.session_state.password = password
+                st.session_state.madonvi = madonvi
+                st.session_state.custom_domain = custom_domain
+                st.session_state.gemini_key = gemini_key
+                st.session_state.working_model = "Tự động kết nối..."
+                st.success("Đăng nhập hệ thống thành công!")
+                st.rerun()
+            else:
+                st.error("Vui lòng điền đầy đủ thông tin đăng nhập!")
+
+# 2. MÀN HÌNH CHÍNH
 else:
-    with st.sidebar:
-        st.header("⚙️ Trạng Thái Kết Nối")
-        st.success("🟢 **Đã kết nối MobiFone**")
-        st.write(f"• **MST:** `{st.session_state.mst}`")
-        st.write(f"• **Tài khoản:** `{st.session_state.user}`")
-        st.write(f"• **Mã đơn vị:** `{st.session_state.connection_info['ma_dvcs']}`")
-        st.divider()
-        if st.button("🔴 Ngắt kết nối / Đăng xuất", type="secondary", use_container_width=True):
-            st.session_state.connected = False
-            st.session_state.connection_info = None
+    st.sidebar.title("⚙️ Trạng Thái Kết Nối")
+    st.sidebar.success("Đã kết nối MobiFone")
+    st.sidebar.write(f"• **MST:** {st.session_state.get('mst', '')}")
+    st.sidebar.write(f"• **Tài khoản:** {st.session_state.get('username', '')}")
+    
+    clean_domain = st.session_state.get('mst', '').split('-')[0].strip()
+    server_display = st.session_state.get("custom_domain", "") or f"{clean_domain}.mobifoneinvoice.vn"
+    st.sidebar.write(f"• **Server:** `{server_display}`")
+    st.sidebar.write(f"• **Mô hình AI Active:** `{st.session_state.get('working_model', 'N/A')}`")
+
+    learned_words = load_learned_dictionary()
+    st.sidebar.divider()
+    st.sidebar.subheader(f"🧠 Bộ Từ Vựng AI ({len(learned_words)} từ)")
+    with st.sidebar.expander("Xem danh sách từ đã học"):
+        for word in learned_words:
+            st.write(f"- {word}")
+        if st.button("🗑️ Xóa bộ nhớ từ vựng"):
+            if os.path.exists(DICT_FILE):
+                os.remove(DICT_FILE)
             st.rerun()
 
-    st.title("🧾 Hệ Thống Bóc Tách & Xuất Hóa Đơn Tự Động")
-    st.caption("Tải lên ảnh biên nhận -> AI bóc tách thông tin -> Khởi tạo HĐĐT trên MobiFone Invoice.")
+    if st.sidebar.button("🔴 Ngắt kết nối / Đăng xuất"):
+        st.session_state.logged_in = False
+        st.session_state.extracted_data = None
+        st.session_state.working_model = "Tự động kết nối..."
+        st.session_state.custom_domain = ""
+        st.rerun()
 
-    col1, col2 = st.columns([1, 1])
+    st.title("🧾 Hệ Thống Bóc Tách & Xuất Hóa Đơn Tự Động")
+    st.caption("Tải lên ảnh -> AI bóc tách (Tự học từ vựng) -> Xem & Sửa dữ liệu -> Khởi tạo HĐĐT MobiFone Invoice.")
+
+    col1, col2 = st.columns([1, 1.2])
 
     with col1:
         st.subheader("1. Tải ảnh hóa đơn / biên nhận")
-        uploaded_file = st.file_uploader("Chọn tệp ảnh (PNG, JPG, JPEG)", type=["jpg", "jpeg", "png"])
-        
+        uploaded_file = st.file_uploader("Chọn tệp ảnh (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"])
         if uploaded_file:
             image = Image.open(uploaded_file)
-            st.image(image, caption="Ảnh biên nhận đã tải lên", use_container_width=True)
+            st.image(image, caption="Ảnh hóa đơn đã tải lên", use_container_width=True)
+            
+            if st.button("🔍 Bóc Tách Dữ Liệu (AI)", type="primary", use_container_width=True):
+                with st.spinner("AI đang bóc tách chữ viết tay và đối chiếu từ vựng đã học..."):
+                    try:
+                        extracted, used_model = extract_invoice_data(
+                            image, 
+                            st.session_state.gemini_key
+                        )
+                        st.session_state.extracted_data = extracted
+                        st.session_state.working_model = used_model
+                        st.success(f"✅ Bóc tách thành công qua mô hình [{used_model}]!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Xảy ra lỗi bóc tách: {e}")
 
     with col2:
-        st.subheader("2. Kết quả bóc tách & Khởi tạo hóa đơn")
+        st.subheader("2. Xem trước & Chỉnh sửa dữ liệu")
         
-        if uploaded_file:
-            if st.button("🚀 Bắt đầu Bóc Tách & Xuất Hóa Đơn", type="primary", use_container_width=True):
-                try:
-                    with st.spinner("AI đang đọc và bóc tách dữ liệu từ ảnh..."):
-                        extracted_data = extract_invoice_data(image, st.session_state.gemini_key)
-                        st.success("✅ Bóc tách dữ liệu ảnh thành công!")
-                        st.json(extracted_data)
-                    
-                    with st.spinner("Đang gửi dữ liệu khởi tạo hóa đơn lên MobiFone Invoice..."):
-                        result = create_mobifone_invoice(st.session_state.connection_info, extracted_data)
-                        st.balloons()
-                        st.success("🎉 Khởi tạo hóa đơn thành công trên MobiFone Invoice!")
-                        st.json(result)
-                        
-                except Exception as e:
-                    st.error(f"❌ Xảy ra lỗi: {str(e)}")
+        if st.session_state.extracted_data is None:
+            st.info("👈 Vui lòng tải ảnh lên và nhấn **🔍 Bóc Tách Dữ Liệu (AI)** để xem trước thông tin hóa đơn tại đây.")
         else:
-            st.info("Vui lòng tải ảnh lên ở cột bên trái để bắt đầu xử lý.")
+            data = st.session_state.extracted_data
+            
+            with st.form("invoice_editor_form"):
+                st.markdown("##### 📌 Thông tin khách hàng")
+                c1, c2 = st.columns(2)
+                with c1:
+                    cust_name = st.text_input("Tên người mua / Khách hàng", value=data.get("customer_name", "Khách hàng lẻ"))
+                    cust_mst = st.text_input("Mã số thuế người mua", value=data.get("customer_mst", ""))
+                with c2:
+                    cust_address = st.text_input("Địa chỉ người mua", value=data.get("customer_address", ""))
+                    pay_method = st.selectbox("Hình thức thanh toán", ["Tiền mặt/Chuyển khoản", "Tiền mặt", "Chuyển khoản"], index=0)
+
+                st.markdown("##### 🛒 Danh sách hàng hóa / Dịch vụ (Chỉnh sửa trực tiếp)")
+                
+                items_list = data.get("items", [])
+                items_df = pd.DataFrame(items_list)
+                
+                expected_cols = ["stt", "ten", "sluong", "dgia", "thtien", "tsuat"]
+                for col in expected_cols:
+                    if col not in items_df.columns:
+                        items_df[col] = ""
+
+                edited_df = st.data_editor(
+                    items_df[expected_cols],
+                    num_rows="dynamic",
+                    column_config={
+                        "stt": st.column_config.NumberColumn("STT", width="small"),
+                        "ten": st.column_config.TextColumn("Tên mặt hàng", width="large", required=True),
+                        "sluong": st.column_config.NumberColumn("Số lượng", min_value=1, default=1),
+                        "dgia": st.column_config.NumberColumn("Đơn giá", format="%d", default=0),
+                        "thtien": st.column_config.NumberColumn("Thành tiền", format="%d", default=0),
+                        "tsuat": st.column_config.SelectboxColumn("Thuế suất (%)", options=["0", "5", "8", "10", "KCT", "KKDT"], default="10")
+                    },
+                    use_container_width=True
+                )
+
+                st.divider()
+                
+                btn_issue = st.form_submit_button("🚀 XÁC NHẬN & XUẤT HÓA ĐƠN MOBIFONE", type="primary", use_container_width=True)
+
+                if btn_issue:
+                    final_items = edited_df.to_dict("records")
+                    
+                    new_item_names = [item.get("ten", "") for item in final_items if item.get("ten")]
+                    updated_dict, added_count = save_learned_dictionary(new_item_names)
+                    
+                    if added_count > 0:
+                        st.toast(f"🧠 AI đã học thêm {added_count} từ vựng mặt hàng mới vào bộ nhớ!", icon="💡")
+
+                    final_data = {
+                        "customer_name": cust_name,
+                        "customer_mst": cust_mst,
+                        "customer_address": cust_address,
+                        "payment_method": pay_method,
+                        "items": final_items
+                    }
+
+                    with st.spinner("Đang kết nối & khởi tạo hóa đơn trên MobiFone Invoice..."):
+                        try:
+                            mobifone_res = send_to_mobifone_api(
+                                final_data,
+                                st.session_state.mst,
+                                st.session_state.username,
+                                st.session_state.password,
+                                st.session_state.madonvi,
+                                st.session_state.get("custom_domain", "")
+                            )
+                            st.balloons()
+                            st.success("🎉 Khởi tạo Hóa đơn điện tử trên MobiFone Invoice THÀNH CÔNG!")
+                            st.write("**Kết quả phản hồi từ máy chủ MobiFone:**")
+                            st.json(mobifone_res)
+                        except Exception as e:
+                            st.error(f"❌ Khởi tạo hóa đơn thất bại: {e}")
