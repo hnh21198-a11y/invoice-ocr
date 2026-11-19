@@ -58,7 +58,7 @@ def load_learned_dictionary() -> list:
                 return json.load(f)
         except Exception:
             return []
-    return ["Gô Chén", "Xô Ánh", "Ghế Lỗ Ruột", "Áo Tô 8", "Áo Tô Trắng Gốc", "Sọt Chén"]
+    return ["Bao tải", "Máy cưa xích", "Bạt chắn mưa", "Dây thừng Polypropylene", "Bộ máy khoan và vặn vít", "Rựa phát quang", "Cuốc sên đa năng", "Kiềm cộng lực", "Thước thép cuộn", "Dây thép kẽm gai", "Đinh sắt các loại"]
 
 def save_learned_dictionary(new_item_names: list) -> tuple[list, int]:
     """Cập nhật và học thêm các từ vựng mới được người dùng sửa thành công"""
@@ -99,47 +99,53 @@ def get_live_gemini_models(api_key: str) -> list:
     return live_models
 
 def extract_invoice_data(image: Image.Image, api_key: str) -> tuple[dict, str]:
-    """Bóc tách chữ viết tay tích hợp Dynamic Few-Shot In-Context Learning"""
+    """Bóc tách chữ viết tay tích hợp Đơn vị tính và Tên đơn vị mua hàng"""
     genai.configure(api_key=api_key)
     
     img_temp = image.copy()
-    img_temp.thumbnail((800, 800), Image.Resampling.LANCZOS)
+    img_temp.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
     img_bytes = io.BytesIO()
-    img_temp.convert("RGB").save(img_bytes, format='JPEG', quality=75)
+    img_temp.convert("RGB").save(img_bytes, format='JPEG', quality=85)
     img_bytes.seek(0)
-    optimized_image = Image.open(img_bytes)
+    optimized_image = Image.Open(img_bytes) if hasattr(Image, 'Open') else Image.open(img_bytes)
 
     learned_words = load_learned_dictionary()
     learned_context = ""
     if learned_words:
-        vocab_list_str = "\n".join([f"    - {w}" for w in learned_words[:40]])
+        vocab_list_str = "\n".join([f"    - {w}" for w in learned_words[:50]])
         learned_context = f"\n    DANH SÁCH TÊN MẶT HÀNG THƯỜNG GẶP CỦA CỬA HÀNG:\n{vocab_list_str}\n    -> Ưu tiên đối chiếu nét chữ viết tay mờ với danh sách từ vựng trên nếu thấy khớp nghĩa."
 
     prompt = f"""
-    Bạn là chuyên gia bóc tách hóa đơn viết tay tiếng Việt. Hãy phân tích biên nhận viết tay này và trả về duy nhất chuỗi JSON chuẩn theo cấu trúc:
+    Bạn là chuyên gia bóc tách hóa đơn/biên nhận viết tay tiếng Việt. Hãy phân tích ảnh và trả về DUY NHẤT chuỗi JSON theo đúng cấu trúc:
     {{
-        "customer_name": "Khách hàng lẻ",
+        "customer_name": "Nguyễn Văn Trinh",
+        "customer_company": "Đồn Biên phòng Tam Giang Tây",
         "customer_mst": "",
-        "customer_address": "",
+        "customer_address": "Ấp Chợ Thủ, xã Tân Ân, tỉnh Cà Mau",
         "payment_method": "Tiền mặt/Chuyển khoản",
         "items": [
             {{
                 "stt": 1,
-                "ten": "Tên mặt hàng",
-                "sluong": 1,
-                "dgia": 100000,
-                "thtien": 100000,
+                "ten": "Bao tải",
+                "dvtinh": "Cái",
+                "sluong": 450,
+                "dgia": 5500,
+                "thtien": 2475000,
                 "tsuat": "10"
             }}
         ]
     }}
 
-    QUY TẮC BÓC TÁCH CHÍNH XÁC:
-    1. TÊN MẶT HÀNG: Đọc kỹ chữ viết tay tiếng Việt.{learned_context}
-    2. QUY ĐỔI TIỀN VIẾT TẮT: Các ô số tiền có dấu chấm ở cuối như 420. -> 420000, 140. -> 140000, 50. -> 50000.
-    3. ĐỐI CHIẾU LOGIC TOÁN HỌC: Bắt buộc `Thành tiền = Số lượng x Đơn giá`.
-    4. Trường `tsuat` mặc định điền "10".
-    5. CHỈ TRẢ VỀ DUY NHẤT CHUỖI JSON.
+    QUY TẮC BÓC TÁCH BẮT BUỘC:
+    1. THÔNG TIN KHÁCH HÀNG:
+       - `customer_name`: Họ tên người mua (nếu ghi rõ tên cá nhân).
+       - `customer_company`: Tên đơn vị/công ty/cơ quan (VD: Đồn Biên phòng Tam Giang Tây, Công ty X...). Nếu trùng người mua thì tách rõ đơn vị ra.
+    2. TÊN MẶT HÀNG & ĐƠN VỊ TÍNH:{learned_context}
+       - Đọc chính xác `dvtinh` từ cột ĐVT (VD: Cái, Cuộn, Bộ, Kg, Bao, Mét, Hộp...). Mặc định là "Cái" nếu không có.
+    3. QUY ĐỔI SỐ TIỀN VIẾT TẮT: Dấu chấm ở cuối số tiền như 4.850. -> 4850000, 2.475. -> 2475000, 31.500 -> 31500.
+    4. ĐỐI CHIẾU LOGIC TOÁN HỌC: Bắt buộc `Thành tiền = Số lượng x Đơn giá`.
+    5. Trường `tsuat` mặc định điền "10".
+    6. CHỈ TRẢ VỀ DUY NHẤT CHUỖI JSON.
     """
 
     candidate_models = get_live_gemini_models(api_key)
@@ -252,13 +258,15 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
 
     cctbao_id = get_cctbao_id(session, working_host, headers)
 
-    # Đóng gói dữ liệu hàng hóa (Có hàm clean_number chống NaN)
+    # Đóng gói dữ liệu hàng hóa & Đơn vị tính
     details_data = []
     tgtcthue = 0.0
     tgtthue = 0.0
 
     for idx, item in enumerate(data.get("items", []), start=1):
         ten_hang = str(item.get("ten", "")).strip() if item.get("ten") and not pd.isna(item.get("ten")) else f"Hàng hóa {idx}"
+        dvt_str = str(item.get("dvtinh", "Cái")).strip() if item.get("dvtinh") and not pd.isna(item.get("dvtinh")) else "Cái"
+        
         sluong = clean_number(item.get("sluong"), default=1.0)
         dgia = clean_number(item.get("dgia"), default=0.0)
         
@@ -269,7 +277,6 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
 
         tsuat_raw = item.get("tsuat", "10")
         tsuat_str = "10" if pd.isna(tsuat_raw) else str(tsuat_raw).replace("%", "").strip()
-        
         tsuat_val = clean_number(tsuat_str, default=10.0) if tsuat_str not in ["KCT", "KKDT", "0", "-1", "-2"] else 0.0
 
         tthue = round(thtien * (tsuat_val / 100.0), 2)
@@ -282,8 +289,8 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
             "stt": idx,
             "ma": str(item.get("ma", idx)),
             "ten": ten_hang,
-            "mdvtinh": "CAI",
-            "dvtinh": "Cái",
+            "mdvtinh": dvt_str.upper(),
+            "dvtinh": dvt_str,
             "sluong": sluong,
             "dgia": dgia,
             "thtien": thtien,
@@ -298,6 +305,7 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
     tgtttbso = tgtcthue + tgtthue
 
     cust_name = str(data.get("customer_name", "Khách hàng lẻ")).strip() or "Khách hàng lẻ"
+    cust_company = str(data.get("customer_company", "")).strip() if not pd.isna(data.get("customer_company")) else ""
     cust_mst = str(data.get("customer_mst", "")).strip() if not pd.isna(data.get("customer_mst")) else ""
     cust_addr = str(data.get("customer_address", "")).strip() if not pd.isna(data.get("customer_address")) else ""
 
@@ -311,7 +319,8 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
             "htttoan": data.get("payment_method", "Tiền mặt/Chuyển khoản"),
             "mst": cust_mst,
             "tnmua": cust_name,
-            "ten": cust_name,
+            "tndvi": cust_company,
+            "ten": cust_company if cust_company else cust_name,
             "dchi": cust_addr,
             "tgtcthue": round(tgtcthue, 2),
             "tgtthue": round(tgtthue, 2),
@@ -459,10 +468,11 @@ else:
             data = st.session_state.extracted_data
             
             with st.form("invoice_editor_form"):
-                st.markdown("##### 📌 Thông tin khách hàng")
+                st.markdown("##### 📌 Thông tin người mua & Đơn vị")
                 c1, c2 = st.columns(2)
                 with c1:
-                    cust_name = st.text_input("Tên người mua / Khách hàng", value=data.get("customer_name", "Khách hàng lẻ"))
+                    cust_name = st.text_input("Họ tên người mua hàng", value=data.get("customer_name", "Khách hàng lẻ"))
+                    cust_company = st.text_input("Tên đơn vị / Tên công ty", value=data.get("customer_company", ""))
                     cust_mst = st.text_input("Mã số thuế người mua", value=data.get("customer_mst", ""))
                 with c2:
                     cust_address = st.text_input("Địa chỉ người mua", value=data.get("customer_address", ""))
@@ -473,15 +483,15 @@ else:
                 items_list = data.get("items", [])
                 items_df = pd.DataFrame(items_list)
                 
-                expected_cols = ["stt", "ten", "sluong", "dgia", "thtien", "tsuat"]
+                expected_cols = ["stt", "ten", "dvtinh", "sluong", "dgia", "thtien", "tsuat"]
                 for col in expected_cols:
                     if col not in items_df.columns:
                         items_df[col] = ""
 
-                # Làm sạch dữ liệu trước khi đưa vào editor để tránh NaN từ đầu
                 items_df = items_df.fillna({
                     "stt": 1,
                     "ten": "",
+                    "dvtinh": "Cái",
                     "sluong": 1,
                     "dgia": 0,
                     "thtien": 0,
@@ -493,7 +503,8 @@ else:
                     num_rows="dynamic",
                     column_config={
                         "stt": st.column_config.NumberColumn("STT", width="small", default=1),
-                        "ten": st.column_config.TextColumn("Tên mặt hàng", width="large", required=True),
+                        "ten": st.column_config.TextColumn("Tên mặt hàng", width="medium", required=True),
+                        "dvtinh": st.column_config.TextColumn("Đơn vị tính (ĐVT)", width="small", default="Cái"),
                         "sluong": st.column_config.NumberColumn("Số lượng", min_value=1, default=1),
                         "dgia": st.column_config.NumberColumn("Đơn giá", format="%d", default=0),
                         "thtien": st.column_config.NumberColumn("Thành tiền", format="%d", default=0),
@@ -517,6 +528,7 @@ else:
 
                     final_data = {
                         "customer_name": cust_name,
+                        "customer_company": cust_company,
                         "customer_mst": cust_mst,
                         "customer_address": cust_address,
                         "payment_method": pay_method,
