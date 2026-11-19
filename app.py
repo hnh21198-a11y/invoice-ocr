@@ -3,6 +3,7 @@ import io
 import json
 import re
 import ssl
+import math
 import requests
 import urllib3
 import pandas as pd
@@ -35,6 +36,20 @@ def get_mobifone_session():
     session.mount('https://', CustomSSLAdapter())
     return session
 
+def clean_number(val, default=0.0) -> float:
+    """Hàm xử lý triệt để giá trị NaN / None / Rỗng để tránh lỗi JSON nan"""
+    if val is None:
+        return default
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return default
+    try:
+        val_str = str(val).strip().replace(',', '')
+        if not val_str or val_str.lower() in ['nan', 'none', 'null']:
+            return default
+        return float(val_str)
+    except Exception:
+        return default
+
 def load_learned_dictionary() -> list:
     """Đọc bộ từ vựng đã học từ tệp json cục bộ"""
     if os.path.exists(DICT_FILE):
@@ -50,7 +65,7 @@ def save_learned_dictionary(new_item_names: list) -> tuple[list, int]:
     current_dict = load_learned_dictionary()
     added_count = 0
     for name in new_item_names:
-        clean_name = str(name).strip()
+        clean_name = str(name).strip() if name and not pd.isna(name) else ""
         if clean_name and len(clean_name) > 1 and clean_name not in current_dict:
             current_dict.append(clean_name)
             added_count += 1
@@ -84,9 +99,7 @@ def get_live_gemini_models(api_key: str) -> list:
     return live_models
 
 def extract_invoice_data(image: Image.Image, api_key: str) -> tuple[dict, str]:
-    """
-    Bóc tách chữ viết tay tích hợp Từ vựng Học thêm (Dynamic Few-Shot In-Context Learning)
-    """
+    """Bóc tách chữ viết tay tích hợp Dynamic Few-Shot In-Context Learning"""
     genai.configure(api_key=api_key)
     
     img_temp = image.copy()
@@ -100,7 +113,7 @@ def extract_invoice_data(image: Image.Image, api_key: str) -> tuple[dict, str]:
     learned_context = ""
     if learned_words:
         vocab_list_str = "\n".join([f"    - {w}" for w in learned_words[:40]])
-        learned_context = f"\n    DANH SÁCH TÊN MẶT HÀNG THƯỜNG GẶP CỦA CỬA HÀNG (ĐÃ ĐƯỢC XÁC NHẬN CHÍNH XÁC TỪ CÁC LẦN XUẤT HÓA ĐƠN TRƯỚC):\n{vocab_list_str}\n    -> Ưu tiên đối chiếu nét chữ viết tay mờ với danh sách từ vựng trên nếu thấy khớp nghĩa."
+        learned_context = f"\n    DANH SÁCH TÊN MẶT HÀNG THƯỜNG GẶP CỦA CỬA HÀNG:\n{vocab_list_str}\n    -> Ưu tiên đối chiếu nét chữ viết tay mờ với danh sách từ vựng trên nếu thấy khớp nghĩa."
 
     prompt = f"""
     Bạn là chuyên gia bóc tách hóa đơn viết tay tiếng Việt. Hãy phân tích biên nhận viết tay này và trả về duy nhất chuỗi JSON chuẩn theo cấu trúc:
@@ -122,9 +135,9 @@ def extract_invoice_data(image: Image.Image, api_key: str) -> tuple[dict, str]:
     }}
 
     QUY TẮC BÓC TÁCH CHÍNH XÁC:
-    1. TÊN MẶT HÀNG: Đọc kỹ chữ viết tay tiếng Việt (đồ gia dụng, nhôm inox, nhựa, nội thất...).{learned_context}
-    2. QUY ĐỔI TIỀN VIẾT TẮT: Các ô số tiền có dấu chấm ở cuối như 420. -> 420000, 140. -> 140000, 50. -> 50000, 230. -> 230000, 300. -> 300000, 730. -> 730000.
-    3. ĐỐI CHIẾU LOGIC TOÁN HỌC: Bắt buộc `Thành tiền = Số lượng x Đơn giá`. Nếu số mờ, lấy Thành tiền chia ngược lại để suy ra đúng Số lượng và Đơn giá.
+    1. TÊN MẶT HÀNG: Đọc kỹ chữ viết tay tiếng Việt.{learned_context}
+    2. QUY ĐỔI TIỀN VIẾT TẮT: Các ô số tiền có dấu chấm ở cuối như 420. -> 420000, 140. -> 140000, 50. -> 50000.
+    3. ĐỐI CHIẾU LOGIC TOÁN HỌC: Bắt buộc `Thành tiền = Số lượng x Đơn giá`.
     4. Trường `tsuat` mặc định điền "10".
     5. CHỈ TRẢ VỀ DUY NHẤT CHUỖI JSON.
     """
@@ -169,7 +182,7 @@ def extract_invoice_data(image: Image.Image, api_key: str) -> tuple[dict, str]:
     return data, used_model
 
 def get_cctbao_id(session: requests.Session, host: str, headers: dict) -> str:
-    """Lấy ID dải ký hiệu mẫu hóa đơn (qlkhsdung_id / cctbao_id) từ MobiFone API (API 2 trong tài liệu)"""
+    """Lấy ID dải ký hiệu mẫu hóa đơn từ MobiFone API"""
     url = f"{host}/api/System/GetDataReferencesByRefId?refId=RF00059"
     try:
         res = session.get(url, headers=headers, verify=False, timeout=8)
@@ -182,12 +195,9 @@ def get_cctbao_id(session: requests.Session, host: str, headers: dict) -> str:
     return ""
 
 def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, madonvi: str, custom_domain: str = "") -> dict:
-    """
-    Kết nối API MobiFone Invoice theo đúng tài liệu kỹ thuật Ver 4.7 (Nghị định 70/123, Thông tư 78)
-    """
+    """Kết nối API MobiFone Invoice chuẩn Ver 4.7"""
     session = get_mobifone_session()
     
-    # 1. Xác định Host (Xử lý tách đuôi chi nhánh -999 để tránh lỗi DNS getaddrinfo failed)
     hosts = []
     if custom_domain and custom_domain.strip():
         d = custom_domain.strip().rstrip('/')
@@ -200,17 +210,8 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
     if default_host not in hosts:
         hosts.append(default_host)
 
-    # 2. Đăng nhập lấy Token (Chuẩn Tài liệu Ver 4.7 Trang 5: username, password)
-    login_routes = [
-        "/api/Account/Login",
-        "/Account/Login",
-        "/api/account/login"
-    ]
-
-    login_payload = {
-        "username": username,
-        "password": password
-    }
+    login_routes = ["/api/Account/Login", "/Account/Login", "/api/account/login"]
+    login_payload = {"username": username, "password": password}
 
     token = ""
     res_ma_dvcs = madonvi
@@ -243,33 +244,35 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
         log_str = "\n".join(login_logs)
         raise Exception(f"Đăng nhập thất bại (Không lấy được Token).\nNhật ký thử nghiệm:\n{log_str}")
 
-    # 3. Header Authorization theo chuẩn MobiFone (Tài liệu Trang 6: Bear token;ma_dvcs)
     ma_dv = res_ma_dvcs if res_ma_dvcs else madonvi
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bear {token};{ma_dv}"
     }
 
-    # 4. Lấy dải ký hiệu hóa đơn (cctbao_id)
     cctbao_id = get_cctbao_id(session, working_host, headers)
 
-    # 5. Đóng gói Payload theo cấu trúc MobiFone Invoice 78 chuẩn Tài liệu Ver 4.7 Trang 8-15
+    # Đóng gói dữ liệu hàng hóa (Có hàm clean_number chống NaN)
     details_data = []
     tgtcthue = 0.0
     tgtthue = 0.0
 
     for idx, item in enumerate(data.get("items", []), start=1):
-        sluong = float(item.get("sluong", 1))
-        dgia = float(item.get("dgia", 0))
-        thtien = float(item.get("thtien", sluong * dgia))
-        tsuat_str = str(item.get("tsuat", "10")).replace("%", "")
+        ten_hang = str(item.get("ten", "")).strip() if item.get("ten") and not pd.isna(item.get("ten")) else f"Hàng hóa {idx}"
+        sluong = clean_number(item.get("sluong"), default=1.0)
+        dgia = clean_number(item.get("dgia"), default=0.0)
         
-        try:
-            tsuat_val = float(tsuat_str) if tsuat_str not in ["KCT", "KKDT", "0", "-1", "-2"] else 0.0
-        except ValueError:
-            tsuat_val = 10.0 if tsuat_str == "10" else 0.0
-            
-        tthue = thtien * (tsuat_val / 100.0)
+        thtien_val = item.get("thtien")
+        thtien = clean_number(thtien_val, default=(sluong * dgia))
+        if thtien == 0.0 and (sluong * dgia) > 0:
+            thtien = sluong * dgia
+
+        tsuat_raw = item.get("tsuat", "10")
+        tsuat_str = "10" if pd.isna(tsuat_raw) else str(tsuat_raw).replace("%", "").strip()
+        
+        tsuat_val = clean_number(tsuat_str, default=10.0) if tsuat_str not in ["KCT", "KKDT", "0", "-1", "-2"] else 0.0
+
+        tthue = round(thtien * (tsuat_val / 100.0), 2)
         tgtien = thtien + tthue
         
         tgtcthue += thtien
@@ -278,7 +281,7 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
         details_data.append({
             "stt": idx,
             "ma": str(item.get("ma", idx)),
-            "ten": str(item.get("ten", "")),
+            "ten": ten_hang,
             "mdvtinh": "CAI",
             "dvtinh": "Cái",
             "sluong": sluong,
@@ -294,6 +297,10 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
 
     tgtttbso = tgtcthue + tgtthue
 
+    cust_name = str(data.get("customer_name", "Khách hàng lẻ")).strip() or "Khách hàng lẻ"
+    cust_mst = str(data.get("customer_mst", "")).strip() if not pd.isna(data.get("customer_mst")) else ""
+    cust_addr = str(data.get("customer_address", "")).strip() if not pd.isna(data.get("customer_address")) else ""
+
     invoice_payload = {
         "editmode": 1,
         "data": [{
@@ -302,14 +309,14 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
             "dvtte": "VND",
             "tgia": 1,
             "htttoan": data.get("payment_method", "Tiền mặt/Chuyển khoản"),
-            "mst": data.get("customer_mst", ""),
-            "tnmua": data.get("customer_name", "Khách hàng lẻ"),
-            "ten": data.get("customer_name", "Khách hàng lẻ"),
-            "dchi": data.get("customer_address", "Hà Nội"),
-            "tgtcthue": tgtcthue,
-            "tgtthue": tgtthue,
-            "tgtttbso": tgtttbso,
-            "tgtttbso_last": tgtttbso,
+            "mst": cust_mst,
+            "tnmua": cust_name,
+            "ten": cust_name,
+            "dchi": cust_addr,
+            "tgtcthue": round(tgtcthue, 2),
+            "tgtthue": round(tgtthue, 2),
+            "tgtttbso": round(tgtttbso, 2),
+            "tgtttbso_last": round(tgtttbso, 2),
             "mdvi": ma_dv,
             "tthdon": 0,
             "is_hdcma": 1,
@@ -319,11 +326,10 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
         }]
     }
 
-    # 6. Gửi request đến Endpoint chuẩn
     save_routes = [
-        "/api/Invoice68/SaveListHoadon78",     # HĐĐT GTGT TT78
-        "/api/Invoice68/SaveListHoadon78MTT",  # Hóa đơn máy tính tiền
-        "/api/Invoice68/SaveAndSignHoadon78"   # Khởi tạo và ký gửi
+        "/api/Invoice68/SaveListHoadon78",
+        "/api/Invoice68/SaveListHoadon78MTT",
+        "/api/Invoice68/SaveAndSignHoadon78"
     ]
 
     auth_headers_to_try = [
@@ -351,7 +357,7 @@ def send_to_mobifone_api(data: dict, mst: str, username: str, password: str, mad
     save_log_str = "\n".join(save_logs)
     raise Exception(f"Không thể khởi tạo hóa đơn tại máy chủ MobiFone ({working_host}).\nNhật ký thử nghiệm:\n{save_log_str}")
 
-# --- CẤU HÌNH GIAO DIỆN STREAMLIT ---
+# --- STREAMLIT UI ---
 st.set_page_config(page_title="Hệ Thống Bóc Tách & Xuất Hóa Đơn Tự Động", layout="wide")
 
 if "logged_in" not in st.session_state:
@@ -363,15 +369,14 @@ if "working_model" not in st.session_state:
 if "custom_domain" not in st.session_state:
     st.session_state.custom_domain = ""
 
-# 1. MÀN HÌNH ĐĂNG NHẬP
 if not st.session_state.logged_in:
     st.title("🔒 Đăng Nhập Hệ Thống (MobiFone Invoice & AI Engine)")
     with st.form("login_form"):
-        mst = st.text_input("Mã số thuế doanh nghiệp (MST)", value="0100686209-999")
+        mst = st.text_input("Mã số thuế doanh nghiệp (MST)", value="2000503695")
         username = st.text_input("Tài khoản MobiFone Invoice", value="ADMINISTRATOR")
         password = st.text_input("Mật khẩu MobiFone", type="password")
         madonvi = st.text_input("Mã đơn vị / Mã cơ sở (Nội bộ)", value="VP")
-        custom_domain = st.text_input("Server Domain MobiFone (Tùy chọn)", placeholder="Ví dụ: 0100686209.mobifoneinvoice.vn")
+        custom_domain = st.text_input("Server Domain MobiFone (Tùy chọn)", placeholder="Ví dụ: 2000503695.mobifoneinvoice.vn")
         gemini_key = st.text_input("Google Gemini API Key", type="password")
         submit = st.form_submit_button("Đăng nhập", type="primary")
 
@@ -390,7 +395,6 @@ if not st.session_state.logged_in:
             else:
                 st.error("Vui lòng điền đầy đủ thông tin đăng nhập!")
 
-# 2. MÀN HÌNH CHÍNH
 else:
     st.sidebar.title("⚙️ Trạng Thái Kết Nối")
     st.sidebar.success("Đã kết nối MobiFone")
@@ -421,7 +425,7 @@ else:
         st.rerun()
 
     st.title("🧾 Hệ Thống Bóc Tách & Xuất Hóa Đơn Tự Động")
-    st.caption("Tải lên ảnh -> AI bóc tách (Tự học từ vựng) -> Xem & Sửa dữ liệu -> Khởi tạo HĐĐT MobiFone Invoice.")
+    st.caption("Tải lên ảnh -> AI bóc tách -> Xem & Sửa dữ liệu -> Khởi tạo HĐĐT MobiFone Invoice.")
 
     col1, col2 = st.columns([1, 1.2])
 
@@ -474,11 +478,21 @@ else:
                     if col not in items_df.columns:
                         items_df[col] = ""
 
+                # Làm sạch dữ liệu trước khi đưa vào editor để tránh NaN từ đầu
+                items_df = items_df.fillna({
+                    "stt": 1,
+                    "ten": "",
+                    "sluong": 1,
+                    "dgia": 0,
+                    "thtien": 0,
+                    "tsuat": "10"
+                })
+
                 edited_df = st.data_editor(
                     items_df[expected_cols],
                     num_rows="dynamic",
                     column_config={
-                        "stt": st.column_config.NumberColumn("STT", width="small"),
+                        "stt": st.column_config.NumberColumn("STT", width="small", default=1),
                         "ten": st.column_config.TextColumn("Tên mặt hàng", width="large", required=True),
                         "sluong": st.column_config.NumberColumn("Số lượng", min_value=1, default=1),
                         "dgia": st.column_config.NumberColumn("Đơn giá", format="%d", default=0),
@@ -495,7 +509,7 @@ else:
                 if btn_issue:
                     final_items = edited_df.to_dict("records")
                     
-                    new_item_names = [item.get("ten", "") for item in final_items if item.get("ten")]
+                    new_item_names = [item.get("ten", "") for item in final_items if item.get("ten") and not pd.isna(item.get("ten"))]
                     updated_dict, added_count = save_learned_dictionary(new_item_names)
                     
                     if added_count > 0:
